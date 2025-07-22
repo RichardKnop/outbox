@@ -1,0 +1,2 @@
+# outbox
+Transactional outbox
