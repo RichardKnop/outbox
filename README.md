@@ -62,6 +62,20 @@ func BusinessLogic(ctx context.Context) error {
 }
 ```
 
+In order to cleanup old processed messages and also run flushing in the backround to pickup any failed flushes, use the outbox daemon:
+
+```go
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+outboxDaemon := outbox.NewDaemon(outbox)
+closeDaemon := outboxDaemon.Start(ctx)
+
+defer func() {
+    closeDaemon()
+}()
+```
+
 ## Development
 
 Run integration tests (requires docker):

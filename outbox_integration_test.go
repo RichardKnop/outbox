@@ -14,7 +14,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
-	mock "github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -117,7 +117,7 @@ func (s *OutboxTestSuite) TearDownTest() {
 	s.producer.AssertExpectations(s.T())
 }
 
-func (s *OutboxTestSuite) TestSendMessage_SingleMessage() {
+func (s *OutboxTestSuite) TestFlushMessage_ProducerError() {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -127,33 +127,23 @@ func (s *OutboxTestSuite) TestSendMessage_SingleMessage() {
 		Value:       []byte("test-value"),
 	}
 
-	err := transactional(ctx, s.db, func(ctx context.Context, tx *sql.Tx) error {
+	err := transactional(ctx, s.db, s.outbox.txOptions, func(ctx context.Context, tx *sql.Tx) error {
 		return s.outbox.Send(ctx, tx, msg)
 	})
 	s.Require().NoError(err)
-
 	s.assertOutboxMessages(msg)
-}
 
-func (s *OutboxTestSuite) TestSendMessage_ManyMessages() {
-	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
-	defer cancel()
+	s.producer.On("Send", mock.Anything, msg.Destination, msg.Key, msg.Value).Return(fmt.Errorf("producer error")).Once()
 
-	messages := make([]Message, 0, 250)
-	for i := 0; i < 250; i++ {
-		messages = append(messages, Message{
-			Destination: "test-topic",
-			Key:         []byte(fmt.Sprintf("test-key-%d", i)),
-			Value:       []byte(fmt.Sprintf("test-value-%d", i)),
-		})
-	}
-
-	err := transactional(ctx, s.db, func(ctx context.Context, tx *sql.Tx) error {
-		return s.outbox.Send(ctx, tx, messages...)
-	})
-	s.Require().NoError(err)
-
-	s.assertOutboxMessages(messages...)
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := s.outbox.Flush(context.Background())
+		s.Require().Error(err)
+	}()
+	wg.Wait()
+	s.assertOutboxMessages(msg)
 }
 
 func (s *OutboxTestSuite) TestFlushMessage_SingleMessage() {
@@ -166,10 +156,11 @@ func (s *OutboxTestSuite) TestFlushMessage_SingleMessage() {
 		Value:       []byte("test-value"),
 	}
 
-	err := transactional(ctx, s.db, func(ctx context.Context, tx *sql.Tx) error {
+	err := transactional(ctx, s.db, s.outbox.txOptions, func(ctx context.Context, tx *sql.Tx) error {
 		return s.outbox.Send(ctx, tx, msg)
 	})
 	s.Require().NoError(err)
+	s.assertOutboxMessages(msg)
 
 	s.producer.On("Send", mock.Anything, msg.Destination, msg.Key, msg.Value).Return(nil).Once()
 
@@ -181,8 +172,101 @@ func (s *OutboxTestSuite) TestFlushMessage_SingleMessage() {
 		s.Require().NoError(err)
 	}()
 	wg.Wait()
-
 	s.assertWholeOutboxProcessed()
+}
+
+func (s *OutboxTestSuite) TestFlushMessage_ManyMessages() {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	messages := mockMessages(101)
+
+	err := transactional(ctx, s.db, s.outbox.txOptions, func(ctx context.Context, tx *sql.Tx) error {
+		return s.outbox.Send(ctx, tx, messages...)
+	})
+	s.Require().NoError(err)
+	s.assertOutboxMessages(messages...)
+
+	for _, msg := range messages {
+		s.producer.On("Send", mock.Anything, msg.Destination, msg.Key, msg.Value).Return(nil).Once()
+	}
+
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := s.outbox.Flush(context.Background())
+		s.Require().NoError(err)
+	}()
+	wg.Wait()
+	s.assertWholeOutboxProcessed()
+}
+
+func (s *OutboxTestSuite) TestFlushMessage_ConcurrentFlushing() {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	messages := mockMessages(201)
+
+	err := transactional(ctx, s.db, s.outbox.txOptions, func(ctx context.Context, tx *sql.Tx) error {
+		return s.outbox.Send(ctx, tx, messages...)
+	})
+	s.Require().NoError(err)
+	s.assertOutboxMessages(messages...)
+
+	for _, msg := range messages {
+		s.producer.On("Send", mock.Anything, msg.Destination, msg.Key, msg.Value).Return(nil).Once()
+	}
+
+	wg := new(sync.WaitGroup)
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := s.outbox.Flush(context.Background())
+			s.Require().NoError(err)
+		}()
+	}
+	wg.Wait()
+	s.assertWholeOutboxProcessed()
+}
+
+func (s *OutboxTestSuite) TestCleanup() {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+
+	messages := mockMessages(10)
+
+	err := transactional(ctx, s.db, s.outbox.txOptions, func(ctx context.Context, tx *sql.Tx) error {
+		return s.outbox.Send(ctx, tx, messages...)
+	})
+	s.Require().NoError(err)
+	s.assertOutboxMessages(messages...)
+
+	// No messages should be processed yet, therefor cleanup should not remove any messages
+	err = s.outbox.Cleanup(ctx, time.Now())
+	s.Require().NoError(err)
+	s.assertOutboxMessages(messages...)
+
+	// Let's flush the outbox now to process the messages
+	for _, msg := range messages {
+		s.producer.On("Send", mock.Anything, msg.Destination, msg.Key, msg.Value).Return(nil).Once()
+	}
+
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := s.outbox.Flush(context.Background())
+		s.Require().NoError(err)
+	}()
+	wg.Wait()
+	s.assertWholeOutboxProcessed()
+
+	// Now we can cleanup the processed messages and outbox should be empty
+	err = s.outbox.Cleanup(ctx, time.Now())
+	s.Require().NoError(err)
+	s.assertEmptyOutbox()
 }
 
 func (s *OutboxTestSuite) migrateUp() {
@@ -246,21 +330,36 @@ func (s *OutboxTestSuite) assertWholeOutboxProcessed() {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
-	stmt, err := s.db.Prepare(fmt.Sprintf(`select count(*) from "%s" where processed_at is null`, testTable))
+	stmt, err := s.db.Prepare(fmt.Sprintf(`
+		select count(*) from "%s" where processed_at is null
+	`, testTable))
 	s.Require().NoError(err)
 	defer stmt.Close()
+
+	processedStmt, err := s.db.Prepare(fmt.Sprintf(`
+		select count(*) from "%s" where processed_at is not null
+	`, testTable))
+	s.Require().NoError(err)
+	defer processedStmt.Close()
 
 	var count int
 	err = stmt.QueryRowContext(ctx).Scan(&count)
 	s.Require().NoError(err)
-	s.Zero(count)
+	s.Zero(count, "there should be no unprocessed messages")
+
+	var processedCount int
+	err = processedStmt.QueryRowContext(ctx).Scan(&processedCount)
+	s.Require().NoError(err)
+	s.True(processedCount > count, "there should be some processed messages")
 }
 
 func (s *OutboxTestSuite) assertOutboxMessages(expected ...Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
-	stmt, err := s.db.Prepare(fmt.Sprintf(`select destination, key, value from "%s" order by id asc`, testTable))
+	stmt, err := s.db.Prepare(fmt.Sprintf(`
+		select destination, key, value from "%s" where processed_at is null order by id asc
+	`, testTable))
 	s.Require().NoError(err)
 	defer stmt.Close()
 
@@ -278,4 +377,16 @@ func (s *OutboxTestSuite) assertOutboxMessages(expected ...Message) {
 	s.Require().NoError(rows.Err())
 
 	s.ElementsMatch(expected, actual)
+}
+
+func mockMessages(num int) []Message {
+	messages := make([]Message, 0, num)
+	for i := 0; i < num; i++ {
+		messages = append(messages, Message{
+			Destination: "test-topic",
+			Key:         []byte(fmt.Sprintf("test-key-%d", i)),
+			Value:       []byte(fmt.Sprintf("test-value-%d", i)),
+		})
+	}
+	return messages
 }

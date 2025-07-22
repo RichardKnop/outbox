@@ -5,8 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
-	"sync"
+	"time"
 )
 
 // Producer interface defines the methods required for sending messages to a destination.
@@ -21,45 +22,46 @@ type Logger interface {
 	Println(v ...any)
 }
 
-// Option is a function that can be used to configure the Outbox instance.
-type Option func(*Outbox)
-
-// WithLogger allows setting a custom logger for the Outbox instance.
-func WithLogger(logger Logger) Option {
-	return func(o *Outbox) {
-		o.logger = logger
-	}
-}
-
-// WithFlushLimit allows setting a custom flush limit for the Outbox instance.
-func WithFlushLimit(limit int) Option {
-	return func(o *Outbox) {
-		o.flushLimit = limit
-	}
-}
-
 // Outbox is a struct that manages the outbox pattern, allowing messages to be stored and sent later.
 type Outbox struct {
-	lock       *sync.RWMutex
-	table      string
-	db         *sql.DB
-	producer   Producer
-	logger     Logger
-	flushLimit int
+	table                  string
+	db                     *sql.DB
+	producer               Producer
+	logger                 Logger
+	flushLimit             int
+	retryAttempts          int
+	retryBackoff           time.Duration
+	retryBackoffMultiplier int
+	retryMaxJitter         time.Duration
+	txOptions              *sql.TxOptions
+	rand                   *rand.Rand
 }
 
-const defaultFlushLimit = 100
+const (
+	defaultFlushLimit             = 100
+	defaultRetryAttempts          = 3
+	defaultRetryBackoff           = 100 * time.Millisecond
+	defaultRetryBackoffMultiplier = 3
+	defaultRetryMaxJitter         = 50 * time.Millisecond
+)
 
 // New creates a new Outbox instance with the specified table name, database connection, and producer.
 // It also accepts optional configuration functions to customize the Outbox instance.
 func New(tableName string, db *sql.DB, producer Producer, opts ...Option) *Outbox {
 	outbox := Outbox{
-		lock:       &sync.RWMutex{},
-		table:      tableName,
-		db:         db,
-		producer:   producer,
-		logger:     log.New(os.Stdout, "[Outbox]:", log.LstdFlags),
-		flushLimit: defaultFlushLimit,
+		table:                  tableName,
+		db:                     db,
+		producer:               producer,
+		logger:                 log.New(os.Stdout, "[Outbox]:", log.LstdFlags),
+		flushLimit:             defaultFlushLimit,
+		retryAttempts:          defaultRetryAttempts,
+		retryBackoff:           defaultRetryBackoff,
+		retryBackoffMultiplier: defaultRetryBackoffMultiplier,
+		retryMaxJitter:         defaultRetryMaxJitter,
+		txOptions: &sql.TxOptions{
+			Isolation: sql.LevelSerializable,
+		},
+		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
 	for _, o := range opts {
@@ -137,7 +139,7 @@ func (o *Outbox) flushMessages(ctx context.Context) (bool, error) {
 		potentiallyMoreMessages bool
 		limit                   = o.flushLimit
 	)
-	if err := transactional(ctx, o.db, func(ctx context.Context, tx *sql.Tx) error {
+	if err := transactionalWithRetry(ctx, o.db, o.txOptions, func(ctx context.Context, tx *sql.Tx) error {
 		messages, err := o.selectMessages(ctx, tx, limit)
 		if err != nil {
 			return fmt.Errorf("select messages for producer failed: %w", err)
@@ -154,11 +156,34 @@ func (o *Outbox) flushMessages(ctx context.Context) (bool, error) {
 		potentiallyMoreMessages = len(messages) == limit
 
 		return nil
-	}); err != nil {
+	}, o.retryOptions()); err != nil {
 		return false, fmt.Errorf("flush messages failed: %w", err)
 	}
 
 	return potentiallyMoreMessages, nil
+}
+
+// Cleanup removes messages from the outbox that have been processed.
+// It deletes messages that have a non-null processed_at timestamp and are older than the specified time.
+func (o *Outbox) Cleanup(ctx context.Context, olderThan time.Time) error {
+	if err := transactional(ctx, o.db, o.txOptions, func(ctx context.Context, tx *sql.Tx) error {
+		stmt, err := tx.Prepare(fmt.Sprintf(`
+			delete from "%s" where processed_at is not null and created_at < $1`, o.table))
+		if err != nil {
+			return fmt.Errorf("prepare statement failed: %w", err)
+		}
+		defer stmt.Close()
+
+		_, err = stmt.ExecContext(ctx, olderThan)
+		if err != nil {
+			return fmt.Errorf("delete statement failed: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return fmt.Errorf("delete processed messages failed: %w", err)
+	}
+	return nil
 }
 
 // selectMessages retrieves messages from the outbox table that have not been processed yet.
@@ -194,21 +219,4 @@ func (o *Outbox) selectMessages(ctx context.Context, tx *sql.Tx, limit int) ([]M
 	}
 
 	return messages, nil
-}
-
-// transactional is a helper function that executes a function within a database transaction.
-func transactional(ctx context.Context, db *sql.DB, fn func(ctx context.Context, tx *sql.Tx) error) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-
-	if err := fn(ctx, tx); err != nil {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil {
-			return fmt.Errorf("rollback failed: %w, original error: %w", rollbackErr, err)
-		}
-		return err
-	}
-
-	return tx.Commit()
 }
