@@ -69,11 +69,9 @@ ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
 outboxDaemon := outbox.NewDaemon(outbox)
-closeDaemon := outboxDaemon.Start(ctx)
+outboxDaemon.Start(ctx)
 
-defer func() {
-    closeDaemon()
-}()
+defer outboxDaemon.Stop()
 ```
 
 ## Development

@@ -24,17 +24,13 @@ type Logger interface {
 
 // Outbox is a struct that manages the outbox pattern, allowing messages to be stored and sent later.
 type Outbox struct {
-	table                  string
-	db                     *sql.DB
-	producer               Producer
-	logger                 Logger
-	flushLimit             int
-	retryAttempts          int
-	retryBackoff           time.Duration
-	retryBackoffMultiplier int
-	retryMaxJitter         time.Duration
-	txOptions              *sql.TxOptions
-	rand                   *rand.Rand
+	table      string
+	db         *sql.DB
+	producer   Producer
+	logger     Logger
+	flushLimit int
+	txOptions  *sql.TxOptions
+	rand       *rand.Rand
 }
 
 const (
@@ -49,17 +45,13 @@ const (
 // It also accepts optional configuration functions to customize the Outbox instance.
 func New(tableName string, db *sql.DB, producer Producer, opts ...Option) *Outbox {
 	outbox := Outbox{
-		table:                  tableName,
-		db:                     db,
-		producer:               producer,
-		logger:                 log.New(os.Stdout, "[Outbox]:", log.LstdFlags),
-		flushLimit:             defaultFlushLimit,
-		retryAttempts:          defaultRetryAttempts,
-		retryBackoff:           defaultRetryBackoff,
-		retryBackoffMultiplier: defaultRetryBackoffMultiplier,
-		retryMaxJitter:         defaultRetryMaxJitter,
+		table:      tableName,
+		db:         db,
+		producer:   producer,
+		logger:     log.New(os.Stdout, "[Outbox]:", log.LstdFlags),
+		flushLimit: defaultFlushLimit,
 		txOptions: &sql.TxOptions{
-			Isolation: sql.LevelSerializable,
+			Isolation: sql.LevelReadCommitted,
 		},
 		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
@@ -139,7 +131,7 @@ func (o *Outbox) flushMessages(ctx context.Context) (bool, error) {
 		potentiallyMoreMessages bool
 		limit                   = o.flushLimit
 	)
-	if err := transactionalWithRetry(ctx, o.db, o.txOptions, func(ctx context.Context, tx *sql.Tx) error {
+	if err := transactional(ctx, o.db, o.txOptions, func(ctx context.Context, tx *sql.Tx) error {
 		messages, err := o.selectMessages(ctx, tx, limit)
 		if err != nil {
 			return fmt.Errorf("select messages for producer failed: %w", err)
@@ -156,7 +148,7 @@ func (o *Outbox) flushMessages(ctx context.Context) (bool, error) {
 		potentiallyMoreMessages = len(messages) == limit
 
 		return nil
-	}, o.retryOptions()); err != nil {
+	}); err != nil {
 		return false, fmt.Errorf("flush messages failed: %w", err)
 	}
 
@@ -193,7 +185,7 @@ func (o *Outbox) Cleanup(ctx context.Context, olderThan time.Time) error {
 func (o *Outbox) selectMessages(ctx context.Context, tx *sql.Tx, limit int) ([]Message, error) {
 	stmt, err := tx.Prepare(fmt.Sprintf(`
 		update "%s" set processed_at = now() where id in (
-			select id from "%s" where processed_at is null order by id asc limit $1
+			select id from "%s" where processed_at is null order by id asc limit $1 for update
 		) returning destination, key, value`, o.table, o.table))
 	if err != nil {
 		return nil, fmt.Errorf("prepare statement failed: %w", err)

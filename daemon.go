@@ -41,6 +41,7 @@ type Daemon struct {
 	maxJitter   time.Duration
 	deleteAfter time.Duration
 	now         clock
+	wg          *sync.WaitGroup
 }
 
 const (
@@ -65,16 +66,13 @@ func NewDaemon(outbox *Outbox, opts ...DaemonOption) *Daemon {
 
 // Start begins the daemon's operation, flushing the outbox at the specified intervals.
 // The daemon will stop flushing when the context is canceled.
-// It returns a function that can be called to wait until the daemon has stopped flushing.
-func (d *Daemon) Start(ctx context.Context) func() {
-	var (
-		ticker = time.NewTicker(d.interval - d.maxJitter/2)
-		wg     = new(sync.WaitGroup)
-	)
+func (d *Daemon) Start(ctx context.Context) {
+	ticker := time.NewTicker(d.interval - d.maxJitter/2)
 
-	wg.Add(1)
+	d.wg = new(sync.WaitGroup)
+	d.wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer d.wg.Done()
 		defer ticker.Stop()
 		for {
 			select {
@@ -96,10 +94,11 @@ func (d *Daemon) Start(ctx context.Context) func() {
 			}
 		}
 	}()
+}
 
-	return func() {
-		wg.Wait()
-	}
+// Stop stops the daemon and waits for it to finish any ongoing operations.
+func (d *Daemon) Stop() {
+	d.wg.Wait()
 }
 
 func (d *Daemon) flush(ctx context.Context) {
